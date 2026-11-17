@@ -163,7 +163,7 @@ jobs:
           {
             echo "## Image sync succeeded"
             echo
-            echo "- Source: `$image`"
-            echo "- Destination: `${ACR_REGISTRY}/${ACR_NAMESPACE}/${repo_name}:${tag}`"
-            echo "- Platform: `linux/$TARGET_ARCH`"
+            echo "- Source: $image"
+            echo "- Destination: ${ACR_REGISTRY}/${ACR_NAMESPACE}/${repo_name}:${tag}"
+            echo "- Platform: linux/$TARGET_ARCH"
           } >> "$GITHUB_STEP_SUMMARY"
