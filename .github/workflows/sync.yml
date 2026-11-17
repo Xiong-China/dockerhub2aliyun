@@ -136,7 +136,6 @@ jobs:
               for item in images
           ]
           print("images=" + json.dumps(matrix, separators=(",", ":")))
-          print(f"::notice::Prepared {len(matrix)} image jobs with {len(repos)} unique source repositories.")
           PY
 
   sync:
