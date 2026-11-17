@@ -129,19 +129,12 @@ jobs:
             source_path_no_tag="$source_path"
           fi
 
-          # ACR Personal Edition repositories are single-level; flatten paths.
-          case "$source_registry" in
-            docker.io) source_prefix="dockerhub" ;;
-            ghcr.io) source_prefix="ghcr-io" ;;
-            *)
-              source_prefix="${source_registry//./-}"
-              source_prefix="${source_prefix//:/-}"
-              ;;
-          esac
-
-          repo_component="$(printf '%s' "$source_path_no_tag" | tr '/' '-')"
-          repo_name="${source_prefix}-${repo_component}"
-          repo_name="$(printf '%s' "$repo_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+          # Use the final image name plus a stable hash of its full source path.
+          # This keeps ACR names short while avoiding collisions between registries/namespaces.
+          image_basename="${source_path_no_tag##*/}"
+          image_basename="$(printf '%s' "$image_basename" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+          source_hash="$(printf '%s' "${source_registry}/${source_path_no_tag}" | sha256sum | cut -c1-8)"
+          repo_name="${image_basename}-${source_hash}"
 
           if (( ${#repo_name} < 2 || ${#repo_name} > 64 )); then
             echo "::error::Generated ACR repository name is outside the 2-64 character limit: $repo_name"
