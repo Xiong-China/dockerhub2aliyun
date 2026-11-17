@@ -133,6 +133,7 @@ jobs:
           # This keeps ACR names short while avoiding collisions between registries/namespaces.
           image_basename="${source_path_no_tag##*/}"
           image_basename="$(printf '%s' "$image_basename" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+          image_basename="${image_basename:0:55}"
           source_hash="$(printf '%s' "${source_registry}/${source_path_no_tag}" | sha256sum | cut -c1-8)"
           repo_name="${image_basename}-${source_hash}"
 
