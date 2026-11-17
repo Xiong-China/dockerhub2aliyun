@@ -70,9 +70,10 @@ jobs:
 
           while IFS= read -r line || [[ -n "$line" ]]; do
             # Trim whitespace and ignore blank lines or comments.
-            image="${line#" ${line%%[![:space:]]*}"}"
-            image="${image%"${image##*[![:space:]]}"}"
-            [[ -z "$image" || "$image" == \\#* ]] && continue
+            image="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            case "$image" in
+              ""|\\#*) continue ;;
+            esac
 
             first_component="${image%%/*}"
             if [[ "$image" == */* && ( "$first_component" == *.* || "$first_component" == *:* || "$first_component" == "localhost" ) ]]; then
@@ -103,7 +104,8 @@ jobs:
                 ;;
             esac
 
-            repo_name="${source_prefix}-${source_path_no_tag//\\//-}"
+            repo_component="$(printf '%s' "$source_path_no_tag" | tr '/' '-')"
+            repo_name="${source_prefix}-${repo_component}"
             repo_name="$(printf '%s' "$repo_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 
             if (( ${#repo_name} < 2 || ${#repo_name} > 64 )); then
