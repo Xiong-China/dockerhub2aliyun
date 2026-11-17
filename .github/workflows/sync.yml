@@ -1,0 +1,139 @@
+name: Sync container images to Alibaba Cloud ACR
+
+on:
+  # 18:00 UTC = 02:00 China Standard Time (UTC+8), every day.
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub2aliyun-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Copy images to ACR Personal Edition
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes skopeo
+
+      - name: Log in and sync images
+        shell: bash
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          # Optional: set both to reduce Docker Hub anonymous pull limits.
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          for name in ACR_REGISTRY ACR_NAMESPACE ACR_USERNAME ACR_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required GitHub Secret: ${name}"
+              exit 1
+            fi
+          done
+
+          # Accept either a bare hostname or the full https:// form.
+          ACR_REGISTRY="${ACR_REGISTRY#https://}"
+          ACR_REGISTRY="${ACR_REGISTRY#http://}"
+          ACR_REGISTRY="${ACR_REGISTRY%/}"
+
+          AUTH_FILE="${RUNNER_TEMP}/skopeo-auth.json"
+          trap 'rm -f "$AUTH_FILE"' EXIT
+
+          printf '%s' "$ACR_PASSWORD" |
+            skopeo login --authfile "$AUTH_FILE" \
+              --username "$ACR_USERNAME" --password-stdin "$ACR_REGISTRY"
+
+          if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            printf '%s' "$DOCKERHUB_TOKEN" |
+              skopeo login --authfile "$AUTH_FILE" \
+                --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          fi
+
+          successes=0
+          failures=0
+
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            # Trim whitespace and ignore blank lines or comments.
+            image="${line#" ${line%%[![:space:]]*}"}"
+            image="${image%"${image##*[![:space:]]}"}"
+            [[ -z "$image" || "$image" == \\#* ]] && continue
+
+            first_component="${image%%/*}"
+            if [[ "$image" == */* && ( "$first_component" == *.* || "$first_component" == *:* || "$first_component" == "localhost" ) ]]; then
+              source_registry="$first_component"
+              source_path="${image#*/}"
+            else
+              source_registry="docker.io"
+              source_path="$image"
+            fi
+
+            last_component="${source_path##*/}"
+            if [[ "$last_component" == *:* ]]; then
+              tag="${last_component##*:}"
+              source_path_no_tag="${source_path%:*}"
+            else
+              tag="latest"
+              source_path_no_tag="$source_path"
+            fi
+
+            # ACR Personal Edition repository names are single-level (no slash).
+            # Prefix the source registry and flatten the source path to keep names unique.
+            case "$source_registry" in
+              docker.io) source_prefix="dockerhub" ;;
+              ghcr.io) source_prefix="ghcr-io" ;;
+              *)
+                source_prefix="${source_registry//./-}"
+                source_prefix="${source_prefix//:/-}"
+                ;;
+            esac
+
+            repo_name="${source_prefix}-${source_path_no_tag//\\//-}"
+            repo_name="$(printf '%s' "$repo_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+
+            if (( ${#repo_name} < 2 || ${#repo_name} > 64 )); then
+              echo "::error::Generated ACR repository name is outside the 2-64 character limit: $repo_name (source: $image)"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            destination="docker://${ACR_REGISTRY}/${ACR_NAMESPACE}/${repo_name}:${tag}"
+            echo "Copying $image -> ${destination#docker://}"
+
+            if skopeo copy --all --retry-times 3 --authfile "$AUTH_FILE" \
+                "docker://$image" "$destination"; then
+              successes=$((successes + 1))
+              echo "Succeeded: $image"
+            else
+              failures=$((failures + 1))
+              echo "::error::Failed to copy image: $image"
+            fi
+          done < images.txt
+
+          {
+            echo "## ACR image sync result"
+            echo
+            echo "- Succeeded: $successes"
+            echo "- Failed: $failures"
+            echo "- Target: ${ACR_REGISTRY}/${ACR_NAMESPACE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Sync finished: $successes succeeded, $failures failed."
+          if (( failures > 0 )); then
+            exit 1
+          fi
