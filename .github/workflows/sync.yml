@@ -2,6 +2,15 @@ name: Sync container images to Alibaba Cloud ACR
 
 on:
   workflow_dispatch:
+    inputs:
+      architecture:
+        description: "Target Linux architecture"
+        required: true
+        type: choice
+        default: amd64
+        options:
+          - amd64
+          - arm64
 
 permissions:
   contents: read
@@ -11,22 +20,54 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Copy images to ACR Personal Edition
+  prepare:
+    name: Read image list
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    outputs:
+      images: ${{ steps.list.outputs.images }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Skopeo
+      - name: Build image matrix
+        id: list
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes skopeo
+          set -Eeuo pipefail
+          images="$(jq -Rsc 'split("\n") | map(select(length > 0 and (startswith("#") | not)))' images.txt)"
+          if [[ "$images" == "[]" ]]; then
+            echo "::error::images.txt contains no images."
+            exit 1
+          fi
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "Prepared $(jq 'length' <<< "$images") image jobs."
 
-      - name: Log in and sync images
+  sync:
+    name: "Sync ${{ matrix.image }} (${{ inputs.architecture }})"
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+    steps:
+      - name: Ensure Skopeo is installed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! command -v skopeo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes skopeo
+          fi
+          skopeo --version
+
+      - name: Copy selected platform to ACR
         shell: bash
         env:
+          SOURCE_IMAGE: ${{ matrix.image }}
+          TARGET_ARCH: ${{ inputs.architecture }}
           ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
           ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
@@ -44,7 +85,14 @@ jobs:
             fi
           done
 
-          # Accept either a bare hostname or the full https:// form.
+          case "$TARGET_ARCH" in
+            amd64|arm64) ;;
+            *)
+              echo "::error::Unsupported target architecture: $TARGET_ARCH"
+              exit 1
+              ;;
+          esac
+
           ACR_REGISTRY="${ACR_REGISTRY#https://}"
           ACR_REGISTRY="${ACR_REGISTRY#http://}"
           ACR_REGISTRY="${ACR_REGISTRY%/}"
@@ -62,77 +110,60 @@ jobs:
                 --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
           fi
 
-          successes=0
-          failures=0
+          image="$SOURCE_IMAGE"
+          first_component="${image%%/*}"
+          if [[ "$image" == */* && ( "$first_component" == *.* || "$first_component" == *:* || "$first_component" == "localhost" ) ]]; then
+            source_registry="$first_component"
+            source_path="${image#*/}"
+          else
+            source_registry="docker.io"
+            source_path="$image"
+          fi
 
-          while IFS= read -r line || [[ -n "$line" ]]; do
-            # Trim whitespace and ignore blank lines or comments.
-            image="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            case "$image" in
-              ""|\#*) continue ;;
-            esac
+          last_component="${source_path##*/}"
+          if [[ "$last_component" == *:* ]]; then
+            tag="${last_component##*:}"
+            source_path_no_tag="${source_path%:*}"
+          else
+            tag="latest"
+            source_path_no_tag="$source_path"
+          fi
 
-            first_component="${image%%/*}"
-            if [[ "$image" == */* && ( "$first_component" == *.* || "$first_component" == *:* || "$first_component" == "localhost" ) ]]; then
-              source_registry="$first_component"
-              source_path="${image#*/}"
-            else
-              source_registry="docker.io"
-              source_path="$image"
-            fi
+          # ACR Personal Edition repositories are single-level; flatten paths.
+          case "$source_registry" in
+            docker.io) source_prefix="dockerhub" ;;
+            ghcr.io) source_prefix="ghcr-io" ;;
+            *)
+              source_prefix="${source_registry//./-}"
+              source_prefix="${source_prefix//:/-}"
+              ;;
+          esac
 
-            last_component="${source_path##*/}"
-            if [[ "$last_component" == *:* ]]; then
-              tag="${last_component##*:}"
-              source_path_no_tag="${source_path%:*}"
-            else
-              tag="latest"
-              source_path_no_tag="$source_path"
-            fi
+          repo_component="$(printf '%s' "$source_path_no_tag" | tr '/' '-')"
+          repo_name="${source_prefix}-${repo_component}"
+          repo_name="$(printf '%s' "$repo_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 
-            # ACR Personal Edition repository names are single-level (no slash).
-            # Prefix the source registry and flatten the source path to keep names unique.
-            case "$source_registry" in
-              docker.io) source_prefix="dockerhub" ;;
-              ghcr.io) source_prefix="ghcr-io" ;;
-              *)
-                source_prefix="${source_registry//./-}"
-                source_prefix="${source_prefix//:/-}"
-                ;;
-            esac
-
-            repo_component="$(printf '%s' "$source_path_no_tag" | tr '/' '-')"
-            repo_name="${source_prefix}-${repo_component}"
-            repo_name="$(printf '%s' "$repo_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
-
-            if (( ${#repo_name} < 2 || ${#repo_name} > 64 )); then
-              echo "::error::Generated ACR repository name is outside the 2-64 character limit: $repo_name (source: $image)"
-              failures=$((failures + 1))
-              continue
-            fi
-
-            destination="docker://${ACR_REGISTRY}/${ACR_NAMESPACE}/${repo_name}:${tag}"
-            echo "Copying $image -> ${destination#docker://}"
-
-            if skopeo copy --all --retry-times 3 --authfile "$AUTH_FILE" \
-                "docker://$image" "$destination"; then
-              successes=$((successes + 1))
-              echo "Succeeded: $image"
-            else
-              failures=$((failures + 1))
-              echo "::error::Failed to copy image: $image"
-            fi
-          done < images.txt
-
-          {
-            echo "## ACR image sync result"
-            echo
-            echo "- Succeeded: $successes"
-            echo "- Failed: $failures"
-            echo "- Target: ${ACR_REGISTRY}/${ACR_NAMESPACE}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Sync finished: $successes succeeded, $failures failed."
-          if (( failures > 0 )); then
+          if (( ${#repo_name} < 2 || ${#repo_name} > 64 )); then
+            echo "::error::Generated ACR repository name is outside the 2-64 character limit: $repo_name"
             exit 1
           fi
+
+          destination="docker://${ACR_REGISTRY}/${ACR_NAMESPACE}/${repo_name}:${tag}"
+          echo "Source: $image"
+          echo "Destination: ${destination#docker://}"
+          echo "Platform: linux/$TARGET_ARCH"
+          echo "Copy mode: one platform only; Docker V2 Schema 2 manifest"
+
+          # Do not use --all: ACR Personal Edition rejects some auxiliary
+          # OCI manifests included in multi-architecture indexes.
+          skopeo --override-os linux --override-arch "$TARGET_ARCH" copy \
+            --format v2s2 --retry-times 2 --authfile "$AUTH_FILE" \
+            "docker://$image" "$destination"
+
+          {
+            echo "## Image sync succeeded"
+            echo
+            echo "- Source: `$image`"
+            echo "- Destination: `${ACR_REGISTRY}/${ACR_NAMESPACE}/${repo_name}:${tag}`"
+            echo "- Platform: `linux/$TARGET_ARCH`"
+          } >> "$GITHUB_STEP_SUMMARY"
