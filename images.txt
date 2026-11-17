@@ -1,0 +1,13 @@
+henrygd/beszel:latest
+henrygd/beszel-agent:alpine
+bililive/recorder:latest
+cloudnas/clouddrive2:latest
+ihmily/douyin-live-recorder:latest
+ghcr.io/fish2018/pansou-web:latest
+willfarrell/autoheal:latest
+ghcr.io/v2raya/v2raya:latest
+dr34m/tao-sync:latest
+openlistteam/openlist:latest
+portainer/portainer-ce:latest
+cloudflare/cloudflared:latest
+justarchi/archisteamfarm:latest
