@@ -1,9 +1,10 @@
 name: Sync container images to Alibaba Cloud ACR
 
 on:
-  # 18:00 UTC = 02:00 China Standard Time (UTC+8), every day.
+  # Run daily at 02:00 China Standard Time.
   schedule:
-    - cron: "0 18 * * *"
+    - cron: "0 2 * * *"
+      timezone: "Asia/Shanghai"
   workflow_dispatch:
 
 permissions:
