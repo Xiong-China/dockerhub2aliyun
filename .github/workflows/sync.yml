@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   prepare:
-    name: Read image list
+    name: Read image list and resolve repository names
     runs-on: ubuntu-latest
     outputs:
       images: ${{ steps.list.outputs.images }}
@@ -34,16 +34,113 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          images="$(jq -Rsc 'split("\n") | map(select(length > 0 and (startswith("#") | not)))' images.txt)"
-          if [[ "$images" == "[]" ]]; then
-            echo "::error::images.txt contains no images."
-            exit 1
-          fi
-          echo "images=$images" >> "$GITHUB_OUTPUT"
-          echo "Prepared $(jq 'length' <<< "$images") image jobs."
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib
+          import json
+          import re
+          from collections import defaultdict
+          from pathlib import Path
+
+          def clean(value):
+              return re.sub(r"[^a-z0-9._-]+", "-", value.lower()).strip("-._")
+
+          def parse_image(image):
+              first, sep, rest = image.partition("/")
+              if sep and ("." in first or ":" in first or first == "localhost"):
+                  registry, source_path = first.lower(), rest
+              else:
+                  registry, source_path = "docker.io", image
+
+              last = source_path.rsplit("/", 1)[-1]
+              if ":" in last:
+                  source_path = source_path.rsplit(":", 1)[0] if "/" not in source_path else source_path[:-(len(last))] + last.rsplit(":", 1)[0]
+              source_path = source_path.strip("/")
+              if not source_path:
+                  raise ValueError(f"Invalid image reference: {image}")
+              key = f"{registry}/{source_path}".lower()
+              parts = source_path.lower().split("/")
+              registry_label = "dockerhub" if registry == "docker.io" else clean(registry.replace(".", "-").replace(":", "-"))
+              return key, parts, registry_label
+
+          images = []
+          for raw in Path("images.txt").read_text(encoding="utf-8").splitlines():
+              image = raw.strip()
+              if not image or image.startswith("#"):
+                  continue
+              key, parts, registry_label = parse_image(image)
+              images.append({"image": image, "key": key})
+
+          if not images:
+              raise SystemExit("images.txt contains no images.")
+
+          # Resolve names by starting with the final path component. Only
+          # colliding repositories gain one more parent component at a time.
+          repos = {}
+          for item in images:
+              key = item["key"]
+              if key not in repos:
+                  _, parts, registry_label = parse_image(item["image"])
+                  repos[key] = {"parts": parts, "registry": registry_label, "depth": 1}
+
+          def make_name(info):
+              parts = info["parts"]
+              depth = info["depth"]
+              if depth <= len(parts):
+                  pieces = parts[-depth:]
+              else:
+                  pieces = [info["registry"]] + parts
+              return clean("-".join(pieces)) or "image"
+
+          for _ in range(100):
+              by_name = defaultdict(list)
+              for key, info in repos.items():
+                  by_name[make_name(info)].append(key)
+              collisions = [keys for keys in by_name.values() if len(keys) > 1]
+              if not collisions:
+                  break
+              changed = False
+              for keys in collisions:
+                  for key in keys:
+                      info = repos[key]
+                      if info["depth"] <= len(info["parts"]):
+                          info["depth"] += 1
+                          changed = True
+              if not changed:
+                  # Extremely rare sanitization/registry collisions: deterministic
+                  # suffix as a final guard, after exhausting parent path names.
+                  for keys in collisions:
+                      for key in keys:
+                          info = repos[key]
+                          base = make_name(info)
+                          info["final"] = f"{base[:54].rstrip('-._')}-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+                  break
+
+          for key, info in repos.items():
+              name = info.get("final", make_name(info))
+              if len(name) > 64:
+                  name = f"{name[:55].rstrip('-._')}-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+              info["final"] = name
+
+          # Ensure truncation did not introduce a collision.
+          final_groups = defaultdict(list)
+          for key, info in repos.items():
+              final_groups[info["final"]].append(key)
+          for name, keys in final_groups.items():
+              if len(keys) > 1:
+                  for key in keys:
+                      info = repos[key]
+                      info["final"] = f"{name[:54].rstrip('-._')}-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+
+          matrix = [
+              {"image": item["image"], "repo_name": repos[item["key"]]["final"]}
+              for item in images
+          ]
+          print("images=" + json.dumps(matrix, separators=(",", ":")))
+          print(f"::notice::Prepared {len(matrix)} image jobs with {len(repos)} unique source repositories.")
+          PY
 
   sync:
-    name: "Sync ${{ matrix.image }} (${{ inputs.architecture }})"
+    name: "Sync ${{ matrix.image }} -> ${{ matrix.repo_name }} (${{ inputs.architecture }})"
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -51,7 +148,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+        include: ${{ fromJSON(needs.prepare.outputs.images) }}
     steps:
       - name: Ensure Skopeo is installed
         shell: bash
@@ -67,6 +164,7 @@ jobs:
         shell: bash
         env:
           SOURCE_IMAGE: ${{ matrix.image }}
+          TARGET_REPO: ${{ matrix.repo_name }}
           TARGET_ARCH: ${{ inputs.architecture }}
           ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
           ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
@@ -111,32 +209,14 @@ jobs:
           fi
 
           image="$SOURCE_IMAGE"
-          first_component="${image%%/*}"
-          if [[ "$image" == */* && ( "$first_component" == *.* || "$first_component" == *:* || "$first_component" == "localhost" ) ]]; then
-            source_registry="$first_component"
-            source_path="${image#*/}"
-          else
-            source_registry="docker.io"
-            source_path="$image"
-          fi
-
-          last_component="${source_path##*/}"
+          last_component="${image##*/}"
           if [[ "$last_component" == *:* ]]; then
             tag="${last_component##*:}"
-            source_path_no_tag="${source_path%:*}"
           else
             tag="latest"
-            source_path_no_tag="$source_path"
           fi
 
-          # Use the final image name plus a stable hash of its full source path.
-          # This keeps ACR names short while avoiding collisions between registries/namespaces.
-          image_basename="${source_path_no_tag##*/}"
-          image_basename="$(printf '%s' "$image_basename" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
-          image_basename="${image_basename:0:55}"
-          source_hash="$(printf '%s' "${source_registry}/${source_path_no_tag}" | sha256sum | cut -c1-8)"
-          repo_name="${image_basename}-${source_hash}"
-
+          repo_name="$TARGET_REPO"
           if (( ${#repo_name} < 2 || ${#repo_name} > 64 )); then
             echo "::error::Generated ACR repository name is outside the 2-64 character limit: $repo_name"
             exit 1
