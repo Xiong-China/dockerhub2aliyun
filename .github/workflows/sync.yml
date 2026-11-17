@@ -72,7 +72,7 @@ jobs:
             # Trim whitespace and ignore blank lines or comments.
             image="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             case "$image" in
-              ""|\\#*) continue ;;
+              ""|\#*) continue ;;
             esac
 
             first_component="${image%%/*}"
