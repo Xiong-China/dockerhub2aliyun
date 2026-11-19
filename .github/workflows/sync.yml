@@ -27,7 +27,7 @@ jobs:
       images: ${{ steps.list.outputs.images }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build image matrix
         id: list
