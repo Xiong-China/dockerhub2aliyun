@@ -11,3 +11,4 @@ openlistteam/openlist:latest
 portainer/portainer-ce:latest
 cloudflare/cloudflared:latest
 justarchi/archisteamfarm:latest
+neosmemo/memos:stable
